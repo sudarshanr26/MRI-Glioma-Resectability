@@ -15,20 +15,16 @@ base_folder = "/Users/name/Desktop/UCSF_data"
 # Metadata CSV file path
 metadata_path = "/Users/name/Desktop/UCSF-PDGM-metadata_v5.csv"
 
-# Load metadata
 df = pd.read_csv(metadata_path)
 
 # Map 'EOR' (Extent of Resection) to binary labels: GTR=1, STR=0
 df['EOR_bin'] = df['EOR'].map({'GTR': 1, 'STR': 0})
 
-# Drop rows where EOR is missing or not GTR/STR
 df = df.dropna(subset=['EOR_bin'])
 
-# Check first few entries
 print(df[['ID', 'EOR', 'EOR_bin']].head())
 
 
-# Define feature extraction function
 def extract_radiomics_features(image_path, mask_path=None):
     try:
         if mask_path is None:
@@ -82,7 +78,6 @@ for _, row in df.iterrows():
     if features_collected:
         all_features.append(feature_dict)
 
-# Convert to DataFrame
 features_df = pd.DataFrame(all_features)
 
 #Model structure
@@ -96,7 +91,7 @@ from sklearn.feature_selection import SelectKBest, mutual_info_classif
 import numpy as np
 import pandas as pd
 
-# === Dataset class with Gaussian noise augmentation ===
+#Dataset class with Gaussian noise augmentation ===
 class NoisyTabularDataset(Dataset):
     def __init__(self, X, y, augment=False):
         self.X = torch.tensor(X, dtype=torch.float32)
@@ -112,7 +107,7 @@ class NoisyTabularDataset(Dataset):
             x = x + torch.randn_like(x) * 0.05  # small Gaussian noise
         return x, y
 
-# === Reduced 3-hidden-layer neural network ===
+#Reduced 3-hidden-layer neural network ===
 class SmallThreeLayerModel(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
@@ -131,7 +126,7 @@ class SmallThreeLayerModel(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# === Feature preprocessing function ===
+#Feature preprocessing function ===
 def advanced_feature_engineering(df):
     df_copy = df.copy()
     
@@ -153,7 +148,7 @@ def advanced_feature_engineering(df):
     
     return df_copy
 
-# === Training function with 5-fold stratified CV ===
+# Training function with 5-fold stratified CV ===
 def train_small_model(features_df, k_best_features=10, max_epochs=30):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -287,6 +282,8 @@ import numpy as np
 from sklearn.preprocessing import PowerTransformer
 from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from sklearn.model_selection import StratifiedKFold
+
+
 #leakage checker
 
 def check_patient_duplicates(df):
