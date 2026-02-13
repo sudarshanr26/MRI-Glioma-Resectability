@@ -358,4 +358,224 @@ def permutation_test(features_df, n_permutations=5):
 permutation_test(features_df, n_permutations=5)
 
 
+#Alt
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import PowerTransformer
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+
+class NoisyTabularDataset(Dataset):
+    def __init__(self, X, y, augment=False):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.augment = augment
+    def __len__(self):
+        return len(self.y)
+    def __getitem__(self, idx):
+        x, y = self.X[idx], self.y[idx]
+        if self.augment:
+            x = x + torch.randn_like(x) * 0.05
+        return x, y
+
+class SmallThreeLayerModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 2)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def advanced_feature_engineering(df):
+    df_copy = df.copy()
+    numeric_cols = df_copy.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in ['ID','EOR_bin']]
+    categorical_cols = df_copy.select_dtypes(include=['object','category']).columns.tolist()
+    
+    for c in numeric_cols:
+        if df_copy[c].isnull().sum() > 0:
+            df_copy[f'{c}_missing'] = df_copy[c].isnull().astype(int)
+            df_copy[c] = df_copy[c].fillna(df_copy[c].median())
+    for c in categorical_cols:
+        df_copy[c] = df_copy[c].fillna('missing')
+    df_copy = pd.get_dummies(df_copy, columns=categorical_cols, drop_first=True)
+    return df_copy
+
+def train_small_model(features_df, k_best_features=20, max_epochs=30):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    df = advanced_feature_engineering(features_df)
+    feature_cols = [c for c in df.columns if c not in ['ID','EOR_bin']]
+    X = df[feature_cols].fillna(0).values
+    y = df['EOR_bin'].values
+
+    selector = SelectKBest(score_func=mutual_info_classif, k=min(k_best_features, X.shape[1]))
+    X_selected = selector.fit_transform(X, y)
+    selected_features = [feature_cols[i] for i in selector.get_support(indices=True)]
+    print("Top selected features (MI):", selected_features)
+
+    scaler = PowerTransformer(method='yeo-johnson')
+    X_scaled = scaler.fit_transform(X_selected)
+    
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    ensemble_predictions = []
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_scaled, y), 1):
+        print(f"Fold {fold} training...")
+        X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+        
+        train_dataset = NoisyTabularDataset(X_train, y_train, augment=True)
+        val_dataset = NoisyTabularDataset(X_val, y_val, augment=False)
+        
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=32)
+        
+        model = SmallThreeLayerModel(X_scaled.shape[1]).to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=1e-3)
+        
+        best_val_loss = float('inf')
+        patience, patience_counter = 7, 0
+        
+        for epoch in range(max_epochs):
+            model.train()
+            for xb, yb in train_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                optimizer.zero_grad()
+                out = model(xb)
+                loss = criterion(out, yb)
+                loss.backward()
+                optimizer.step()
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    out = model(xb)
+                    val_loss += criterion(out, yb).item() * xb.size(0)
+            val_loss /= len(val_loader.dataset)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), f'best_model_fold{fold}.pth')
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+        
+        model.load_state_dict(torch.load(f'best_model_fold{fold}.pth'))
+        model.eval()
+        with torch.no_grad():
+            X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
+            outputs = model(X_val_tensor)
+            probs = torch.softmax(outputs, dim=1).cpu().numpy()
+            ensemble_predictions.append((probs, y_val))
+    
+    all_preds, all_labels = [], []
+    for preds, labels in ensemble_predictions:
+        all_preds.extend(np.argmax(preds, axis=1))
+        all_labels.extend(labels)
+    acc = np.mean(np.array(all_preds) == np.array(all_labels))
+    print(f"Ensemble Accuracy: {acc:.4f}")
+    
+    lr = LogisticRegression(max_iter=1000)
+    lr.fit(X_scaled, y)
+    coefs = lr.coef_[0]
+    
+    feature_effects = []
+    for feat, coef in zip(selected_features, coefs):
+        direction = "GTR↑" if coef>0 else "STR↑"
+        feature_effects.append((feat, coef, direction))
+    
+    return ensemble_predictions, feature_effects
+
+def evaluate_ensemble_metrics(ensemble_preds):
+    all_preds, all_labels, all_probs = [], [], []
+    for probs, labels in ensemble_preds:
+        preds = np.argmax(probs, axis=1)
+        all_preds.extend(preds)
+        all_labels.extend(labels)
+        all_probs.extend(probs[:,1])  # probability of GTR
+    
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
+    
+    print("Accuracy:", accuracy_score(all_labels, all_preds))
+    print("Precision:", precision_score(all_labels, all_preds))
+    print("Recall:", recall_score(all_labels, all_preds))
+    print("F1 Score:", f1_score(all_labels, all_preds))
+    try:
+        print("ROC AUC:", roc_auc_score(all_labels, all_probs))
+    except ValueError:
+        print("ROC AUC: Not available (single class present)")
+
+ensemble_preds, feature_effects = train_small_model(features_df)
+evaluate_ensemble_metrics(ensemble_preds)
+
+print("\nTop features and direction of effect (GTR↑ means higher value favors GTR):")
+for feat, coef, direction in feature_effects:
+    print(f"{feat}: coef={coef:.3f} → {direction}")
+
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+
+def evaluate_ensemble_metrics(ensemble_preds):
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    for probs, labels in ensemble_preds:
+        preds = np.argmax(probs, axis=1)
+        all_preds.extend(preds)
+        all_labels.extend(labels)
+        # Store probability for positive class (assuming class 1 is positive)
+        all_probs.extend(probs[:, 1])
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
+
+    acc = accuracy_score(all_labels, all_preds)
+    prec = precision_score(all_labels, all_preds)
+    rec = recall_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds)
+    try:
+        roc_auc = roc_auc_score(all_labels, all_probs)
+    except ValueError:
+        roc_auc = float('nan')  
+
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall: {rec:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"ROC AUC: {roc_auc:.4f}")
+
+    return {
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1_score": f1,
+        "roc_auc": roc_auc
+    }
+
+
+
 
