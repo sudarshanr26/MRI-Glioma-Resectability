@@ -4,296 +4,134 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import PowerTransformer
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from torch.utils.data import Dataset, DataLoader
 import SimpleITK as sitk
 from radiomics import featureextractor
+import matplotlib.pyplot as plt
 
-base_folder = "/Users/name/Desktop/UCSF_data"
-metadata_path = "/Users/name/Desktop/UCSF-PDGM-metadata_v5.csv"
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+base_folder = '/Users/name/Desktop/AI NGS Project/UCSF_data'
+metadata_path = '/Users/name/Desktop/AI NGS Project/UCSF-PDGM-metadata_v5.csv'
+
+# ============================================================================
+# STEP 1: LOAD AND PREPARE METADATA
+# ============================================================================
+print("="*80)
+print("STEP 1: Loading metadata and preparing labels")
+print("="*80)
 
 df = pd.read_csv(metadata_path)
 
+# Binary encode EOR
 df['EOR_bin'] = df['EOR'].map({'GTR': 1, 'STR': 0})
-
 df = df.dropna(subset=['EOR_bin'])
 
+print(f"Total patients with EOR data: {len(df)}")
+print(f"GTR: {(df['EOR_bin'] == 1).sum()}, STR: {(df['EOR_bin'] == 0).sum()}")
 print(df[['ID', 'EOR', 'EOR_bin']].head())
 
+# ============================================================================
+# STEP 2: EXTRACT RADIOMICS FEATURES
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 2: Extracting radiomics features from MRI")
+print("="*80)
 
-def extract_radiomics_features(image_path, mask_path=None):
+def extract_radiomics_features(image_path, mask_path):
+    """
+    Extract radiomics features from a single MRI modality
+    """
     try:
-        if mask_path is None:
-            # If no mask, create one from image (non-zero voxels)
-            image = sitk.ReadImage(image_path)
-            mask_array = sitk.GetArrayFromImage(image) > 0
-            mask = sitk.GetImageFromArray(mask_array.astype(np.uint8))
-            mask.CopyInformation(image)
-        else:
-            mask = sitk.ReadImage(mask_path)
-
+        image = sitk.ReadImage(image_path)
+        mask = sitk.ReadImage(mask_path)
+        
         params = {'force2D': False}  # Use 3D features
         extractor = featureextractor.RadiomicsFeatureExtractor(**params)
         result = extractor.execute(image_path, mask)
-
+        
         # Filter only numeric features
         features = {k: v for k, v in result.items() if isinstance(v, (int, float))}
         return features
-
+    
     except Exception as e:
         print(f"Error extracting features from {image_path}: {e}")
         return None
 
-
-
-
 all_features = []
+modalities = ['T1c_bias', 'T2', 'FLAIR']
 
-modalities = ['T1c_bias', 'T2', 'FLAIR']  
-
-for _, row in df.iterrows():
+for idx, row in df.iterrows():
     patient_id = row['ID']
     patient_folder = os.path.join(base_folder, f"{patient_id}_nifti")
     feature_dict = {'ID': patient_id, 'EOR_bin': row['EOR_bin']}
     features_collected = False
-
-    # Always get the mask file (assume same for all modalities)
+    
     mask_file = os.path.join(patient_folder, f"{patient_id}_tumor_segmentation.nii.gz")
-
+    
     for modality in modalities:
         image_file = os.path.join(patient_folder, f"{patient_id}_{modality}.nii.gz")
-        # Extract features for this modality
         features = extract_radiomics_features(image_file, mask_file)
+        
         if features:
             features_collected = True
-            # Optionally prefix the feature names with modality
             for k, v in features.items():
                 feature_dict[f"{modality}_{k}"] = v
-
+    
     if features_collected:
         all_features.append(feature_dict)
+    
+    if (idx + 1) % 50 == 0:
+        print(f"Processed {idx + 1}/{len(df)} patients...")
 
 features_df = pd.DataFrame(all_features)
+print(f"\nTotal patients with extracted features: {len(features_df)}")
+print(f"Total features extracted: {len(features_df.columns) - 2}")  # Exclude ID and EOR_bin
 
-import os
-import torch
-from torch import nn, optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import PowerTransformer
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-import numpy as np
-import pandas as pd
-
-class NoisyTabularDataset(Dataset):
-    def __init__(self, X, y, augment=False):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)
-        self.augment = augment
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, idx):
-        x, y = self.X[idx], self.y[idx]
-        if self.augment:
-            x = x + torch.randn_like(x) * 0.05  # small Gaussian noise
-        return x, y
-
-class SmallThreeLayerModel(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 2)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-def advanced_feature_engineering(df):
-    df_copy = df.copy()
-    
-    numeric_cols = df_copy.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c not in ['ID', 'EOR_bin']]
-    categorical_cols = df_copy.select_dtypes(include=['object', 'category']).columns.tolist()
-    
-    for c in numeric_cols:
-        if df_copy[c].isnull().sum() > 0:
-            df_copy[f'{c}_missing'] = df_copy[c].isnull().astype(int)
-            df_copy[c] = df_copy[c].fillna(df_copy[c].median())
-    
-    for c in categorical_cols:
-        df_copy[c] = df_copy[c].fillna('missing')
-    df_copy = pd.get_dummies(df_copy, columns=categorical_cols, drop_first=True)
-    
-    return df_copy
-
-def train_small_model(features_df, k_best_features=10, max_epochs=30):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    df = advanced_feature_engineering(features_df)
-    feature_cols = [c for c in df.columns if c not in ['ID','EOR_bin']]
-    X = df[feature_cols].fillna(0).values
-    y = df['EOR_bin'].values
-
-    selector = SelectKBest(score_func=mutual_info_classif, k=min(k_best_features, X.shape[1]))
-    X = selector.fit_transform(X, y)
-
-    
-    scaler = PowerTransformer(method='yeo-johnson')
-    X = scaler.fit_transform(X)
-
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    ensemble_predictions = []
-
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
-        print(f"Fold {fold} training...")
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
-
-        train_dataset = NoisyTabularDataset(X_train, y_train, augment=True)
-        val_dataset = NoisyTabularDataset(X_val, y_val, augment=False)
-
-        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=32)
-
-        model = SmallThreeLayerModel(X.shape[1]).to(device)
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-        best_val_loss = float('inf')
-        patience, patience_counter = 7, 0
-
-        for epoch in range(max_epochs):
-            model.train()
-            for xb, yb in train_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                optimizer.zero_grad()
-                out = model(xb)
-                loss = criterion(out, yb)
-                loss.backward()
-                optimizer.step()
-
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for xb, yb in val_loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    out = model(xb)
-                    val_loss += criterion(out, yb).item() * xb.size(0)
-            val_loss /= len(val_loader.dataset)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                torch.save(model.state_dict(), f'best_model_fold{fold}.pth')
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    break
-
-        model.load_state_dict(torch.load(f'best_model_fold{fold}.pth'))
-        model.eval()
-        with torch.no_grad():
-            X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
-            outputs = model(X_val_tensor)
-            probs = torch.softmax(outputs, dim=1).cpu().numpy()
-            ensemble_predictions.append((probs, y_val))
-
-    all_preds, all_labels = [], []
-    for preds, labels in ensemble_predictions:
-        all_preds.extend(np.argmax(preds, axis=1))
-        all_labels.extend(labels)
-    acc = np.mean(np.array(all_preds) == np.array(all_labels))
-    print(f"Ensemble Accuracy (reduced model): {acc:.4f}")
-    return ensemble_predictions
-
-
-ensemble_preds = train_ensemble(df)
-
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-
-def evaluate_ensemble_metrics(ensemble_preds):
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    for probs, labels in ensemble_preds:
-        preds = np.argmax(probs, axis=1)
-        all_preds.extend(preds)
-        all_labels.extend(labels)
-        # Store probability for positive class (assuming class 1 is positive)
-        all_probs.extend(probs[:, 1])
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
-
-    acc = accuracy_score(all_labels, all_preds)
-    prec = precision_score(all_labels, all_preds)
-    rec = recall_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-    try:
-        roc_auc = roc_auc_score(all_labels, all_probs)
-    except ValueError:
-        roc_auc = float('nan')  # In case only one class present in y_true
-
-    print(f"Accuracy: {acc:.4f}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall: {rec:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"ROC AUC: {roc_auc:.4f}")
-
-    return {
-        "accuracy": acc,
-        "precision": prec,
-        "recall": rec,
-        "f1_score": f1,
-        "roc_auc": roc_auc
-    }
-
-import pandas as pd
-import numpy as np
-from sklearn.preprocessing import PowerTransformer
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-from sklearn.model_selection import StratifiedKFold
-
+# ============================================================================
+# STEP 3: DATA QUALITY CHECKS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 3: Running data quality and leakage checks")
+print("="*80)
 
 def check_patient_duplicates(df):
+    """Check for duplicate patient IDs"""
     duplicate_ids = df['ID'][df['ID'].duplicated()]
     if len(duplicate_ids) > 0:
         print("WARNING: Duplicate patient IDs found:", duplicate_ids.tolist())
     else:
-        print("No duplicate patient IDs detected.")
+        print("✓ No duplicate patient IDs detected.")
 
 def check_feature_label_corr(df):
+    """Check for suspiciously high correlations with label (potential leakage)"""
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     numeric_cols = [c for c in numeric_cols if c not in ['ID', 'EOR_bin']]
     
     correlations = df[numeric_cols + ['EOR_bin']].corr()['EOR_bin'].abs().sort_values(ascending=False)
-    high_corr = correlations[correlations > 0.9]  # threshold for suspiciously high correlation
-    if len(high_corr) > 1:  # 'EOR_bin' itself will be 1.0
-        print("Features highly correlated with label (possible leakage):")
+    high_corr = correlations[correlations > 0.9]
+    
+    if len(high_corr) > 1:  # EOR_bin itself will be 1.0
+        print("WARNING: Features highly correlated with label (possible leakage):")
         print(high_corr.drop('EOR_bin'))
     else:
-        print("No features with suspiciously high correlation to the label.")
+        print("✓ No features with suspiciously high correlation to the label.")
 
 def check_preprocessing_leakage(df, k_best_features=40):
+    """Verify preprocessing is done correctly within CV folds"""
     feature_cols = [c for c in df.columns if c not in ['ID', 'EOR_bin']]
     X = df[feature_cols].fillna(0).values
     y = df['EOR_bin'].values
     
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
+    all_clean = True
     for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
         X_train, X_val = X[train_idx], X[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
@@ -309,83 +147,124 @@ def check_preprocessing_leakage(df, k_best_features=40):
         X_val_scaled = scaler.transform(X_val_selected)
         
         if np.isnan(X_val_scaled).any():
-            print(f"Fold {fold}: NaNs detected after scaling (possible leakage or preprocessing issue)")
-        else:
-            print(f"Fold {fold}: Preprocessing applied correctly, no leakage detected.")
-
-def run_leakage_checks(df):
-    print("\n--- Checking patient-level duplicates ---")
-    check_patient_duplicates(df)
+            print(f"WARNING Fold {fold}: NaNs detected after scaling")
+            all_clean = False
     
-    print("\n--- Checking feature-label correlations ---")
-    check_feature_label_corr(df)
-    
-    print("\n--- Checking preprocessing leakage during CV ---")
-    check_preprocessing_leakage(df)
+    if all_clean:
+        print("✓ Preprocessing applied correctly across all folds, no leakage detected.")
 
-run_leakage_checks(features_df)
+print("\n--- Checking patient-level duplicates ---")
+check_patient_duplicates(features_df)
 
+print("\n--- Checking feature-label correlations ---")
+check_feature_label_corr(features_df)
 
-import numpy as np
+print("\n--- Checking preprocessing leakage during CV ---")
+check_preprocessing_leakage(features_df)
 
-def permutation_test(features_df, n_permutations=5):
-    from copy import deepcopy
-    from sklearn.metrics import accuracy_score
+# ============================================================================
+# STEP 4: CREATE PATIENT CHARACTERISTICS TABLE
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 4: Creating patient characteristics table")
+print("="*80)
+
+def create_train_val_characteristics_table(features_df, metadata_df):
+    """
+    Create a table comparing characteristics between training and validation sets
+    """
+    # Merge to get clinical variables if available
+    merged_df = features_df.copy()
     
-    # Store original labels
-    y_orig = features_df['EOR_bin'].values
-    X_orig = features_df.drop(columns=['ID','EOR_bin'])
+    y = merged_df['EOR_bin'].values
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
-    print("\n--- Running Permutation Test ---")
+    train_chars = []
+    val_chars = []
     
-    for i in range(n_permutations):
-        # Shuffle labels
-        y_shuffled = np.random.permutation(y_orig)
-        df_shuffled = deepcopy(features_df)
-        df_shuffled['EOR_bin'] = y_shuffled
+    for fold, (train_idx, val_idx) in enumerate(skf.split(merged_df, y), 1):
+        train_data = merged_df.iloc[train_idx]
+        val_data = merged_df.iloc[val_idx]
         
-        # Train ensemble on shuffled labels
-        ensemble_preds = train_ensemble(df_shuffled)
+        # Calculate characteristics for training set
+        train_chars.append({
+            'Fold': fold,
+            'N': len(train_data),
+            'GTR_n': (train_data['EOR_bin'] == 1).sum(),
+            'GTR_pct': (train_data['EOR_bin'] == 1).sum() / len(train_data) * 100,
+            'STR_n': (train_data['EOR_bin'] == 0).sum(),
+            'STR_pct': (train_data['EOR_bin'] == 0).sum() / len(train_data) * 100,
+        })
         
-        # Compute accuracy on all validation folds
-        all_preds, all_labels = [], []
-        for preds, labels in ensemble_preds:
-            all_preds.extend(np.argmax(preds, axis=1))
-            all_labels.extend(labels)
-        acc = np.mean(np.array(all_preds) == np.array(all_labels))
-        print(f"Permutation {i+1}: Accuracy = {acc:.4f}")
+        # Calculate characteristics for validation set
+        val_chars.append({
+            'Fold': fold,
+            'N': len(val_data),
+            'GTR_n': (val_data['EOR_bin'] == 1).sum(),
+            'GTR_pct': (val_data['EOR_bin'] == 1).sum() / len(val_data) * 100,
+            'STR_n': (val_data['EOR_bin'] == 0).sum(),
+            'STR_pct': (val_data['EOR_bin'] == 0).sum() / len(val_data) * 100,
+        })
+    
+    train_df = pd.DataFrame(train_chars)
+    val_df = pd.DataFrame(val_chars)
+    
+    # Calculate averages across folds
+    train_avg = train_df.mean(numeric_only=True)
+    val_avg = val_df.mean(numeric_only=True)
+    
+    # Create summary table
+    summary = pd.DataFrame({
+        'Characteristic': [
+            'N (patients)',
+            'GTR, n (%)',
+            'STR, n (%)'
+        ],
+        'Training Set (avg across folds)': [
+            f"{train_avg['N']:.0f}",
+            f"{train_avg['GTR_n']:.0f} ({train_avg['GTR_pct']:.1f}%)",
+            f"{train_avg['STR_n']:.0f} ({train_avg['STR_pct']:.1f}%)"
+        ],
+        'Validation Set (avg across folds)': [
+            f"{val_avg['N']:.0f}",
+            f"{val_avg['GTR_n']:.0f} ({val_avg['GTR_pct']:.1f}%)",
+            f"{val_avg['STR_n']:.0f} ({val_avg['STR_pct']:.1f}%)"
+        ]
+    })
+    
+    return summary, train_df, val_df
 
-permutation_test(features_df, n_permutations=5)
+summary_table, train_details, val_details = create_train_val_characteristics_table(features_df, df)
+print("\n=== Table 1: Patient Characteristics - Training vs Validation Sets ===")
+print(summary_table.to_string(index=False))
+summary_table.to_csv('patient_characteristics_table.csv', index=False)
+print("\n✓ Table saved to 'patient_characteristics_table.csv'")
 
-
-#Alt
-
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import PowerTransformer
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+# ============================================================================
+# STEP 5: DEFINE MODEL ARCHITECTURE
+# ============================================================================
 
 class NoisyTabularDataset(Dataset):
+    """Dataset with optional data augmentation via Gaussian noise"""
     def __init__(self, X, y, augment=False):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
         self.augment = augment
+    
     def __len__(self):
         return len(self.y)
+    
     def __getitem__(self, idx):
         x, y = self.X[idx], self.y[idx]
         if self.augment:
-            x = x + torch.randn_like(x) * 0.05
+            x = x + torch.randn_like(x) * 0.05  # Small Gaussian noise
         return x, y
 
 class SmallThreeLayerModel(nn.Module):
+    """
+    Compact feed-forward neural network for binary classification
+    Architecture: Input -> 64 -> 32 -> 16 -> 2 (output logits)
+    """
     def __init__(self, input_dim):
         super().__init__()
         self.net = nn.Sequential(
@@ -399,63 +278,106 @@ class SmallThreeLayerModel(nn.Module):
             nn.ReLU(),
             nn.Linear(16, 2)
         )
+    
     def forward(self, x):
         return self.net(x)
 
 def advanced_feature_engineering(df):
+    """Handle missing values and encode categorical variables"""
     df_copy = df.copy()
-    numeric_cols = df_copy.select_dtypes(include=[np.number]).columns.tolist()
-    numeric_cols = [c for c in numeric_cols if c not in ['ID','EOR_bin']]
-    categorical_cols = df_copy.select_dtypes(include=['object','category']).columns.tolist()
     
+    numeric_cols = df_copy.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c not in ['ID', 'EOR_bin']]
+    categorical_cols = df_copy.select_dtypes(include=['object', 'category']).columns.tolist()
+    
+    # Handle missing values in numeric columns
     for c in numeric_cols:
         if df_copy[c].isnull().sum() > 0:
             df_copy[f'{c}_missing'] = df_copy[c].isnull().astype(int)
             df_copy[c] = df_copy[c].fillna(df_copy[c].median())
+    
+    # Handle categorical columns
     for c in categorical_cols:
         df_copy[c] = df_copy[c].fillna('missing')
     df_copy = pd.get_dummies(df_copy, columns=categorical_cols, drop_first=True)
+    
     return df_copy
 
-def train_small_model(features_df, k_best_features=20, max_epochs=30):
+# ============================================================================
+# STEP 6: TRAIN MODEL WITH CROSS-VALIDATION
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 6: Training model with 5-fold stratified cross-validation")
+print("="*80)
+
+def train_model_with_cv(features_df, k_best_features=20, max_epochs=30):
+    """
+    Train neural network with 5-fold stratified cross-validation
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
+    # Feature engineering
     df = advanced_feature_engineering(features_df)
-    feature_cols = [c for c in df.columns if c not in ['ID','EOR_bin']]
+    feature_cols = [c for c in df.columns if c not in ['ID', 'EOR_bin']]
     X = df[feature_cols].fillna(0).values
     y = df['EOR_bin'].values
-
+    
+    print(f"\nInitial feature count: {X.shape[1]}")
+    
+    # Feature selection using mutual information
     selector = SelectKBest(score_func=mutual_info_classif, k=min(k_best_features, X.shape[1]))
     X_selected = selector.fit_transform(X, y)
     selected_features = [feature_cols[i] for i in selector.get_support(indices=True)]
-    print("Top selected features (MI):", selected_features)
-
+    
+    print(f"Selected {len(selected_features)} features based on mutual information")
+    print(f"Top 5 selected features: {selected_features[:5]}")
+    
+    # Scaling
     scaler = PowerTransformer(method='yeo-johnson')
     X_scaled = scaler.fit_transform(X_selected)
     
+    # Cross-validation setup
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     ensemble_predictions = []
     
+    all_train_losses = []
+    all_val_losses = []
+    
     for fold, (train_idx, val_idx) in enumerate(skf.split(X_scaled, y), 1):
-        print(f"Fold {fold} training...")
+        print(f"\n{'='*60}")
+        print(f"Training Fold {fold}/5")
+        print(f"{'='*60}")
+        
         X_train, X_val = X_scaled[train_idx], X_scaled[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
         
+        print(f"Training set: {len(X_train)} patients (GTR: {(y_train==1).sum()}, STR: {(y_train==0).sum()})")
+        print(f"Validation set: {len(X_val)} patients (GTR: {(y_val==1).sum()}, STR: {(y_val==0).sum()})")
+        
+        # Create datasets and loaders
         train_dataset = NoisyTabularDataset(X_train, y_train, augment=True)
         val_dataset = NoisyTabularDataset(X_val, y_val, augment=False)
         
         train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=32)
         
+        # Initialize model
         model = SmallThreeLayerModel(X_scaled.shape[1]).to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
         
+        # Training loop
         best_val_loss = float('inf')
         patience, patience_counter = 7, 0
         
+        fold_train_losses = []
+        fold_val_losses = []
+        
         for epoch in range(max_epochs):
+            # Training phase
             model.train()
+            train_loss = 0
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 optimizer.zero_grad()
@@ -463,6 +385,12 @@ def train_small_model(features_df, k_best_features=20, max_epochs=30):
                 loss = criterion(out, yb)
                 loss.backward()
                 optimizer.step()
+                train_loss += loss.item() * xb.size(0)
+            
+            train_loss /= len(train_loader.dataset)
+            fold_train_losses.append(train_loss)
+            
+            # Validation phase
             model.eval()
             val_loss = 0
             with torch.no_grad():
@@ -470,7 +398,11 @@ def train_small_model(features_df, k_best_features=20, max_epochs=30):
                     xb, yb = xb.to(device), yb.to(device)
                     out = model(xb)
                     val_loss += criterion(out, yb).item() * xb.size(0)
+            
             val_loss /= len(val_loader.dataset)
+            fold_val_losses.append(val_loss)
+            
+            # Early stopping
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
@@ -478,8 +410,16 @@ def train_small_model(features_df, k_best_features=20, max_epochs=30):
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
                     break
+            
+            if (epoch + 1) % 5 == 0:
+                print(f"Epoch {epoch+1}/{max_epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
+        all_train_losses.append(fold_train_losses)
+        all_val_losses.append(fold_val_losses)
+        
+        # Load best model and get predictions
         model.load_state_dict(torch.load(f'best_model_fold{fold}.pth'))
         model.eval()
         with torch.no_grad():
@@ -488,94 +428,195 @@ def train_small_model(features_df, k_best_features=20, max_epochs=30):
             probs = torch.softmax(outputs, dim=1).cpu().numpy()
             ensemble_predictions.append((probs, y_val))
     
+    # Calculate overall accuracy
     all_preds, all_labels = [], []
     for preds, labels in ensemble_predictions:
         all_preds.extend(np.argmax(preds, axis=1))
         all_labels.extend(labels)
     acc = np.mean(np.array(all_preds) == np.array(all_labels))
-    print(f"Ensemble Accuracy: {acc:.4f}")
     
+    print(f"\n{'='*60}")
+    print(f"Cross-Validation Complete - Overall Accuracy: {acc:.4f}")
+    print(f"{'='*60}")
+    
+    # Train logistic regression for feature interpretability
     lr = LogisticRegression(max_iter=1000)
     lr.fit(X_scaled, y)
     coefs = lr.coef_[0]
     
     feature_effects = []
     for feat, coef in zip(selected_features, coefs):
-        direction = "GTR↑" if coef>0 else "STR↑"
+        direction = "GTR↑" if coef > 0 else "STR↑"
         feature_effects.append((feat, coef, direction))
     
-    return ensemble_predictions, feature_effects
+    # Sort by absolute coefficient value
+    feature_effects.sort(key=lambda x: abs(x[1]), reverse=True)
+    
+    return ensemble_predictions, feature_effects, all_train_losses, all_val_losses
+
+# Train the model
+ensemble_preds, feature_effects, train_losses, val_losses = train_model_with_cv(features_df, k_best_features=20, max_epochs=30)
+
+# ============================================================================
+# STEP 7: EVALUATE MODEL PERFORMANCE
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 7: Evaluating model performance")
+print("="*80)
 
 def evaluate_ensemble_metrics(ensemble_preds):
+    """Calculate comprehensive performance metrics"""
     all_preds, all_labels, all_probs = [], [], []
+    
     for probs, labels in ensemble_preds:
         preds = np.argmax(probs, axis=1)
         all_preds.extend(preds)
         all_labels.extend(labels)
-        all_probs.extend(probs[:,1])  # probability of GTR
+        all_probs.extend(probs[:, 1])  # Probability of GTR
     
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     all_probs = np.array(all_probs)
     
-    print("Accuracy:", accuracy_score(all_labels, all_preds))
-    print("Precision:", precision_score(all_labels, all_preds))
-    print("Recall:", recall_score(all_labels, all_preds))
-    print("F1 Score:", f1_score(all_labels, all_preds))
-    try:
-        print("ROC AUC:", roc_auc_score(all_labels, all_probs))
-    except ValueError:
-        print("ROC AUC: Not available (single class present)")
-
-ensemble_preds, feature_effects = train_small_model(features_df)
-evaluate_ensemble_metrics(ensemble_preds)
-
-print("\nTop features and direction of effect (GTR↑ means higher value favors GTR):")
-for feat, coef, direction in feature_effects:
-    print(f"{feat}: coef={coef:.3f} → {direction}")
-
-
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-
-def evaluate_ensemble_metrics(ensemble_preds):
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    for probs, labels in ensemble_preds:
-        preds = np.argmax(probs, axis=1)
-        all_preds.extend(preds)
-        all_labels.extend(labels)
-        # Store probability for positive class (assuming class 1 is positive)
-        all_probs.extend(probs[:, 1])
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
-
-    acc = accuracy_score(all_labels, all_preds)
-    prec = precision_score(all_labels, all_preds)
-    rec = recall_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds)
-    try:
-        roc_auc = roc_auc_score(all_labels, all_probs)
-    except ValueError:
-        roc_auc = float('nan')  
-
-    print(f"Accuracy: {acc:.4f}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall: {rec:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"ROC AUC: {roc_auc:.4f}")
-
-    return {
-        "accuracy": acc,
-        "precision": prec,
-        "recall": rec,
-        "f1_score": f1,
-        "roc_auc": roc_auc
+    # Calculate metrics
+    metrics = {
+        "accuracy": accuracy_score(all_labels, all_preds),
+        "precision": precision_score(all_labels, all_preds),
+        "recall": recall_score(all_labels, all_preds),
+        "f1_score": f1_score(all_labels, all_preds),
     }
+    
+    try:
+        metrics["roc_auc"] = roc_auc_score(all_labels, all_probs)
+    except ValueError:
+        metrics["roc_auc"] = float('nan')
+    
+    print("\n=== Model Performance Metrics ===")
+    print(f"Accuracy:  {metrics['accuracy']:.4f}")
+    print(f"Precision: {metrics['precision']:.4f}")
+    print(f"Recall:    {metrics['recall']:.4f}")
+    print(f"F1 Score:  {metrics['f1_score']:.4f}")
+    print(f"ROC AUC:   {metrics['roc_auc']:.4f}")
+    
+    return metrics
 
+metrics = evaluate_ensemble_metrics(ensemble_preds)
 
+# ============================================================================
+# STEP 8: FEATURE IMPORTANCE ANALYSIS
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 8: Feature importance analysis")
+print("="*80)
 
+print("\nTop 10 features and their effects (based on logistic regression coefficients):")
+print("GTR↑ means higher value favors GTR, STR↑ means higher value favors STR\n")
+for i, (feat, coef, direction) in enumerate(feature_effects[:10], 1):
+    print(f"{i:2d}. {feat:60s} coef={coef:+.4f} → {direction}")
 
+# Save feature effects to CSV
+feature_effects_df = pd.DataFrame(feature_effects, columns=['Feature', 'Coefficient', 'Direction'])
+feature_effects_df.to_csv('feature_importance.csv', index=False)
+print("\n✓ Feature importance saved to 'feature_importance.csv'")
+
+# ============================================================================
+# STEP 9: PLOT LEARNING CURVES
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 9: Generating learning curves")
+print("="*80)
+
+plt.figure(figsize=(12, 6))
+
+# Plot all folds
+for i, (train_loss, val_loss) in enumerate(zip(train_losses, val_losses)):
+    epochs = range(1, len(train_loss) + 1)
+    plt.plot(epochs, train_loss, alpha=0.3, color='blue', linewidth=1)
+    plt.plot(epochs, val_loss, alpha=0.3, color='red', linewidth=1)
+
+# Add average curves
+avg_train_loss = np.mean([losses for losses in train_losses], axis=0)
+avg_val_loss = np.mean([losses for losses in val_losses], axis=0)
+epochs = range(1, len(avg_train_loss) + 1)
+
+plt.plot(epochs, avg_train_loss, color='blue', linewidth=2, label='Avg Training Loss')
+plt.plot(epochs, avg_val_loss, color='red', linewidth=2, label='Avg Validation Loss')
+
+plt.xlabel('Epoch', fontsize=12)
+plt.ylabel('Loss (Cross-Entropy)', fontsize=12)
+plt.title('Training vs Validation Loss Across All CV Folds', fontsize=14)
+plt.legend(fontsize=10)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('learning_curves.png', dpi=300, bbox_inches='tight')
+print("✓ Learning curves saved to 'learning_curves.png'")
+
+# ============================================================================
+# STEP 10: PERMUTATION TEST (OPTIONAL)
+# ============================================================================
+print("\n" + "="*80)
+print("STEP 10: Running permutation test (optional - validates model isn't just noise)")
+print("="*80)
+
+def permutation_test(features_df, n_permutations=5):
+    """
+    Test if model performance is better than random by shuffling labels
+    If accuracy with shuffled labels is similar to real labels, model may be overfitting
+    """
+    from copy import deepcopy
+    
+    print(f"\nRunning {n_permutations} permutations...")
+    print("Expected: Accuracy should be ~0.50 (random chance) with shuffled labels\n")
+    
+    y_orig = features_df['EOR_bin'].values
+    
+    for i in range(n_permutations):
+        y_shuffled = np.random.permutation(y_orig)
+        df_shuffled = deepcopy(features_df)
+        df_shuffled['EOR_bin'] = y_shuffled
+        
+        # Train with shuffled labels
+        ensemble_preds_shuffled, _, _, _ = train_model_with_cv(df_shuffled, k_best_features=20, max_epochs=30)
+        
+        # Calculate accuracy
+        all_preds, all_labels = [], []
+        for preds, labels in ensemble_preds_shuffled:
+            all_preds.extend(np.argmax(preds, axis=1))
+            all_labels.extend(labels)
+        acc = np.mean(np.array(all_preds) == np.array(all_labels))
+        print(f"Permutation {i+1}/{n_permutations}: Accuracy = {acc:.4f}")
+
+# Uncomment to run permutation test (takes time)
+# permutation_test(features_df, n_permutations=3)
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+print("\n" + "="*80)
+print("ANALYSIS COMPLETE - SUMMARY")
+print("="*80)
+
+print(f"""
+Dataset:
+  - Total patients: {len(features_df)}
+  - GTR cases: {(features_df['EOR_bin'] == 1).sum()}
+  - STR cases: {(features_df['EOR_bin'] == 0).sum()}
+
+Model Performance (5-fold cross-validation):
+  - Accuracy:  {metrics['accuracy']:.4f}
+  - Precision: {metrics['precision']:.4f}
+  - Recall:    {metrics['recall']:.4f}
+  - F1 Score:  {metrics['f1_score']:.4f}
+  - ROC AUC:   {metrics['roc_auc']:.4f}
+
+Generated Files:
+  ✓ patient_characteristics_table.csv
+  ✓ feature_importance.csv
+  ✓ learning_curves.png
+  ✓ best_model_fold1.pth through best_model_fold5.pth
+
+Note: All metrics represent cross-validated performance.
+No separate test set was used - all patients were used in CV folds.
+""")
+
+print("="*80)
